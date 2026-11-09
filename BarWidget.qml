@@ -3,10 +3,9 @@
 // made the old widget position/size itself correctly — PopupCard anchors to
 // anchorItem automatically, no manual screen-edge math needed).
 //
-// Data layer is rewired to the service surface confirmed working in the
-// newer plugin (popupModel for live notifications, historyDir for on-disk
-// history) instead of the old pendingModel/pastModel calls, which is why
-// notifications weren't showing.
+// Data layer reads ~/.local/state/omarchy/notifications/{live,history,quiet}.json
+// and acts via `omarchy-shell notifications` IPC (Omarchy 4.5 no longer gives
+// bar-widgets the first-party notifications service).
 //
 // UI: no more Pending/Recently tabs — a search field, a
 // "Recent and live notifications" label with a Clear all button, then a
@@ -18,6 +17,7 @@ import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "NotificationLogic.js" as NotificationLogic
 
@@ -40,23 +40,54 @@ BarWidget {
     return "k:" + row.app + "|" + row.summary + "|" + row.timestamp
   }
 
-  // Look up the long-running notifications service through the shell host.
-  readonly property var hostShell: bar && bar.shell ? bar.shell : null
-  readonly property var notificationService: hostShell && hostShell.firstPartyServiceFor
-    ? hostShell.firstPartyServiceFor("omarchy.notifications") : null
+  // Omarchy 4.5 no longer hands omarchy.notifications to bar-widget plugins,
+  // so read the service's state files and drive it over `omarchy-shell` IPC.
+  readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state")
+    + "/omarchy/notifications"
+  property var liveEntries: []
+  property var historyEntries: []
+  readonly property int liveCount: liveEntries.length
+  readonly property int historyLimit: 10
 
-  readonly property int liveCount: notificationService && notificationService.popupModel
-    ? notificationService.popupModel.count : 0
-  readonly property string historyDir: notificationService && notificationService.historyDir
-    ? String(notificationService.historyDir) : ""
+  readonly property bool dndSupported: true
+  property bool dndOn: false
+  function ipc(args) {
+    Quickshell.execDetached(["omarchy-shell", "notifications"].concat(args))
+  }
+  function toggleDnd() { ipc(["toggleDnd"]) }
 
-  // ---- DND (guarded: lives on Omarchy's first-party service, not here).
-  readonly property bool dndSupported: !!notificationService
-    && typeof notificationService.doNotDisturb === "boolean"
-    && typeof notificationService.setDoNotDisturb === "function"
-  readonly property bool dndOn: dndSupported && notificationService.doNotDisturb
-  function toggleDnd() {
-    if (dndSupported) notificationService.setDoNotDisturb(!notificationService.doNotDisturb)
+  function parseArray(raw) {
+    try {
+      var value = JSON.parse(String(raw || "[]"))
+      return Array.isArray(value) ? value : []
+    } catch (e) {
+      return [] // torn write; next fileChanged reloads
+    }
+  }
+
+  FileView {
+    path: root.stateDir + "/live.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: { root.liveEntries = root.parseArray(text()); root.rebuildRows() }
+    onLoadFailed: root.liveEntries = []
+  }
+  FileView {
+    path: root.stateDir + "/history.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: { root.historyEntries = root.parseArray(text()); root.rebuildRows() }
+  }
+  FileView {
+    path: root.stateDir + "/quiet.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      try { root.dndOn = JSON.parse(text()).dnd === true } catch (e) {}
+    }
   }
 
   readonly property string icon: {
@@ -66,13 +97,12 @@ BarWidget {
   }
 
   // Theme palette (mirrors the old widget's tokens).
-  readonly property color colForeground: Color.foreground
-  readonly property color colDim: Qt.darker(Color.foreground, 1.4)
-  readonly property color colBorder: Style.normalBorderFor(Color.foreground, Color.accent)
-  readonly property color colSurface: Style.normalFillFor(Color.foreground, Color.accent)
-  readonly property color colAccent: Color.accent
-  readonly property int cardRadius: notificationService && notificationService.cornerRadius
-    ? notificationService.cornerRadius : Style.cornerRadius
+  readonly property color colForeground: Commons.Color.foreground
+  readonly property color colDim: Qt.darker(Commons.Color.foreground, 1.4)
+  readonly property color colBorder: Style.normalBorderFor(Commons.Color.foreground, Commons.Color.accent)
+  readonly property color colSurface: Style.normalFillFor(Commons.Color.foreground, Commons.Color.accent)
+  readonly property color colAccent: Commons.Color.accent
+  readonly property int cardRadius: Style.cornerRadius
 
   function notificationIconSource(icon) {
     var value = String(icon || "")
@@ -98,42 +128,34 @@ BarWidget {
     return haystack.indexOf(needle) >= 0
   }
 
+  function rowFrom(entry, isLive) {
+    return {
+      isLive: isLive,
+      id: entry.originalId !== undefined ? entry.originalId : null,
+      key: String(entry.key || ""),
+      app: String(entry.app || "Unknown application"),
+      appIcon: String(entry.appIcon || ""),
+      summary: String(entry.summary || "Notification"),
+      body: String(entry.body || ""),
+      glyph: String(entry.glyph || ""),
+      urgency: Number(entry.urgency === undefined ? 1 : entry.urgency),
+      timestamp: Number(entry.ts || 0) * 1000
+    }
+  }
+
   function rebuildRows() {
     var rows = []
-    for (var h = 0; h < root.historyRows.length; ++h) {
-      var history = root.historyRows[h]
-      if (root.hiddenHistoryKeys[root.historyKey(history)]) continue
-      if (!rowMatches(history)) continue
-      rows.push({
-        sourceIndex: -1,
-        isLive: false,
-        id: history.id,
-        app: history.app,
-        appIcon: history.appIcon,
-        summary: history.summary,
-        body: history.body,
-        glyph: history.glyph,
-        urgency: history.urgency,
-        timestamp: history.timestamp
-      })
+    var history = root.historyEntries.slice()
+      .sort(function(a, b) { return (b.ts || 0) - (a.ts || 0) })
+      .slice(0, root.historyLimit)
+    for (var h = 0; h < history.length; ++h) {
+      var past = rowFrom(history[h], false)
+      if (root.hiddenHistoryKeys[root.historyKey(past)] || !rowMatches(past)) continue
+      rows.push(past)
     }
-    var model = root.notificationService ? root.notificationService.popupModel : null
-    if (!model) { root.filteredRows = rows; return }
-    for (var i = 0; i < model.count; ++i) {
-      var row = model.get(i)
-      if (!row || !rowMatches(row)) continue
-      rows.push({
-        sourceIndex: i,
-        isLive: true,
-        id: row.id !== undefined ? row.id : null,
-        app: String(row.appName || row.app || "Unknown application"),
-        appIcon: String(row.appIcon || ""),
-        summary: String(row.summary || "Notification"),
-        body: String(row.body || ""),
-        glyph: String(row.glyph || NotificationLogic.glyphFromHints(row.hints)),
-        urgency: Number(row.urgency || 1),
-        timestamp: Number(row.timestamp || 0)
-      })
+    for (var i = 0; i < root.liveEntries.length; ++i) {
+      var live = rowFrom(root.liveEntries[i], true)
+      if (rowMatches(live)) rows.push(live)
     }
     rows.sort(function(a, b) { return (b.timestamp || 0) - (a.timestamp || 0) })
     root.filteredRows = rows
@@ -142,15 +164,13 @@ BarWidget {
   function dismiss(row) {
     if (!row) return
     if (row.isLive) {
-      if (root.notificationService && typeof root.notificationService.dismissPopup === "function")
-        root.notificationService.dismissPopup(row.sourceIndex)
+      // shortcut: IPC only dismisses by summary substring, so same-summary cards close together
+      ipc(["dismiss", row.summary])
     } else {
-      var key = root.historyKey(row)
+      // No IPC removes one history entry; hide it locally until it ages out.
       var next = Object.assign({}, root.hiddenHistoryKeys)
-      next[key] = true
+      next[root.historyKey(row)] = true
       root.hiddenHistoryKeys = next
-      if (root.notificationService && typeof root.notificationService.removeHistoryEntry === "function")
-        root.notificationService.removeHistoryEntry(row.id)
     }
     rebuildRows()
   }
@@ -161,83 +181,21 @@ BarWidget {
   }
 
   function clearAll() {
-    if (!root.notificationService) return
-    if (typeof root.notificationService.clearPopups === "function") root.notificationService.clearPopups()
-    if (typeof root.notificationService.clearHistory === "function") root.notificationService.clearHistory()
-    root.historyRows = []
-    root.hiddenHistoryKeys = ({})
+    ipc(["dismissAll"])
+    var next = Object.assign({}, root.hiddenHistoryKeys)
+    for (var i = 0; i < root.historyEntries.length; ++i)
+      next[root.historyKey(rowFrom(root.historyEntries[i], false))] = true
+    root.hiddenHistoryKeys = next
     rebuildRows()
-  }
-
-  function parseHistory(raw) {
-    var parsed = []
-    var lines = String(raw || "").split("\n")
-    for (var i = 0; i < lines.length; ++i) {
-      var line = lines[i].trim()
-      if (!line) continue
-      try {
-        var value = JSON.parse(line)
-        if (!value || typeof value !== "object") continue
-        parsed.push({
-          id: value.id !== undefined ? value.id : (value.originalId !== undefined ? value.originalId : null),
-          app: String(value.app || "Unknown application"),
-          appIcon: String(value.appIcon || ""),
-          summary: String(value.summary || "Notification"),
-          body: String(value.body || ""),
-          glyph: String(value.glyph || ""),
-          urgency: Number(value.urgency === undefined ? 1 : value.urgency),
-          timestamp: Number(value.timestamp || 0)
-        })
-      } catch (e) {
-        // A torn write is ignored, matching the first-party parser.
-      }
-    }
-    parsed.sort(function(a, b) { return b.timestamp - a.timestamp })
-    root.historyRows = parsed.slice(0, root.notificationService && root.notificationService.historyLimit
-      ? Number(root.notificationService.historyLimit) : 10)
-    rebuildRows()
-  }
-
-  function refreshHistory() {
-    if (!root.historyDir || historyReader.running) return
-    historyReader.command = ["bash", "-c",
-      "awk 1 \"$1\"/*.json 2>/dev/null || true", "--", root.historyDir]
-    historyReader.running = true
   }
 
   onPopupOpenChanged: {
     if (popupOpen) {
       clearSearch()
-      refreshHistory()
       rebuildRows()
     }
   }
   onQueryChanged: rebuildRows()
-
-  Timer {
-    interval: 500
-    repeat: true
-    running: root.popupOpen
-    onTriggered: root.refreshHistory()
-  }
-
-  Process {
-    id: historyReader
-    running: false
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.parseHistory(text)
-    }
-  }
-
-  Connections {
-    target: root.notificationService ? root.notificationService.popupModel : null
-    function onCountChanged() { root.rebuildRows() }
-    function onDataChanged() { root.rebuildRows() }
-    function onRowsInserted() { root.rebuildRows() }
-    function onRowsRemoved() { root.rebuildRows() }
-    function onModelReset() { root.rebuildRows() }
-  }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -313,7 +271,7 @@ BarWidget {
               id: dndGlyph
               text: root.dndOn ? "󰂛" : "󰂚"
               font.family: root.bar ? root.bar.fontFamily : ""
-              color: root.dndOn ? Color.background : root.colDim
+              color: root.dndOn ? Commons.Color.background : root.colDim
               font.pixelSize: Style.font.body
               anchors.verticalCenter: parent.verticalCenter
             }
@@ -322,7 +280,7 @@ BarWidget {
               id: dndLabel
               text: root.dndOn ? "DND on" : "DND off"
               font.family: root.bar ? root.bar.fontFamily : ""
-              color: root.dndOn ? Color.background : root.colDim
+              color: root.dndOn ? Commons.Color.background : root.colDim
               font.pixelSize: Style.font.caption
               font.bold: true
               anchors.verticalCenter: parent.verticalCenter
@@ -468,7 +426,7 @@ BarWidget {
               Layout.alignment: Qt.AlignTop
               visible: rowCard.modelData.glyph !== ""
               text: rowCard.modelData.glyph
-              color: rowCard.modelData.urgency === 2 ? Color.urgent : Color.accent
+              color: rowCard.modelData.urgency === 2 ? Commons.Color.urgent : Commons.Color.accent
               font.family: root.bar ? root.bar.fontFamily : ""
               font.pixelSize: Style.font.icon
             }
